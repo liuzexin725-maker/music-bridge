@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Music Bridge</title>
+  <desc>A silver IPC3 on a pale macOS tile, with a precise continuous-corner mask and transparent outer margins.</desc>
+  <defs>
+    <path id="tile" d="M336 100H688C770 100 816 100 870 154C924 208 924 254 924 336V688C924 770 924 816 870 870C816 924 770 924 688 924H336C254 924 208 924 154 870C100 816 100 770 100 688V336C100 254 100 208 154 154C208 100 254 100 336 100Z"/>
+    <clipPath id="tile-mask"><use href="#tile"/></clipPath>
+  </defs>
+  <use href="#tile" fill="#cbd0d9" opacity="0.24" transform="translate(0 3)"/>
+  <use href="#tile" fill="#fbfbfc"/>
+  <image href="MusicBridgeArtwork.png" x="100" y="100" width="824" height="824" clip-path="url(#tile-mask)"/>
+  <use href="#tile" fill="none" stroke="#dce0e7" stroke-opacity="0.5" stroke-width="1"/>
+</svg>
