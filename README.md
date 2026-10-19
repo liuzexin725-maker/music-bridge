@@ -3,7 +3,7 @@
 按用户例图重建的 macOS 应用。SwiftUI 界面，AppKit 窗口，本地 amdl 与 wrapper-lite 下载服务。
 
 ```sh
-./script/build_and_run.sh --verify
+bash script/build_and_run.sh --verify
 ```
 
 构建产物：`dist/MusicBridgeApp.app`。打开即读取实际挂载设备，没有演示模式。名称、挂载点和可写状态取自系统；未连接、只读或权限不明时不能导入。下载与导入分开执行，点击“开始导入”才扫描并复制文件。
@@ -31,7 +31,7 @@
 ## 定向检查
 
 ```sh
-./script/check.sh
+bash script/check.sh
 ```
 
 检查公开歌单来源、伪造域名拒绝、任务取消、设备状态与导入门禁、音质和封面设置保存、实际下载参数、动效输入边界与减少动态效果分支、配置保留、导入路径和符号链接边界、旧服务检查回调，以及进程末尾无换行输出。进程回归使用临时脚本和注入的就绪响应，不访问 Apple 登录态，也不下载音乐。采用独立 Swift 检查程序，当前机器的 Command Line Tools 缺少 XCTest，无法运行标准 `swift test`。
