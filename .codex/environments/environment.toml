@@ -1,0 +1,10 @@
+version = 1
+name = "Music Bridge"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "Run"
+icon = "run"
+command = "bash script/build_and_run.sh"

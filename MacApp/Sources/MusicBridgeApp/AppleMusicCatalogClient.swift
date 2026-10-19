@@ -65,6 +65,7 @@ struct AppleMusicCatalogClient: Sendable {
                     skipped.append(query)
                 }
             } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
                 lastSearchError = error
                 skipped.append(query)
             }

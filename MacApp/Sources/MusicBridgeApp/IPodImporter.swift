@@ -5,10 +5,21 @@ struct FileSignature: Sendable, Equatable {
     let modificationDate: Date
 }
 
-struct IPodDevice: Sendable {
+enum DeviceWriteState: String, Sendable {
+    case writable = "可写"
+    case readOnly = "只读"
+    case unknown = "待确认"
+}
+
+struct IPodDevice: Sendable, Equatable {
     let name: String
     let rootURL: URL
     let musicURL: URL
+    let writeState: DeviceWriteState
+    let isRockbox: Bool
+    var volumeIdentifier: String? = nil
+
+    var canImport: Bool { writeState == .writable }
 }
 
 struct MediaCheckResult: Sendable {
@@ -27,6 +38,7 @@ struct IPodImportReport: Sendable {
     let missingDestinationCovers: Int
     let missingBitrates: Int
     let sourceFiles: Int
+    let warningCount: Int
     let messages: [String]
 }
 
@@ -46,12 +58,20 @@ struct IPodImporter: Sendable {
             let iPodControl = rootURL.appendingPathComponent("iPod_Control", isDirectory: true)
             let musicURL = rootURL.appendingPathComponent("Music", isDirectory: true)
             guard isDirectory(rockbox) || (isDirectory(iPodControl) && isDirectory(musicURL)) else { return nil }
-            guard isDirectory(musicURL) else { return nil }
-            guard FileManager.default.isWritableFile(atPath: musicURL.path) else { return nil }
-
-            let name = (try? rootURL.resourceValues(forKeys: [.volumeNameKey]).volumeName)
+            let values = try? rootURL.resourceValues(forKeys: [.volumeNameKey, .volumeIsReadOnlyKey, .volumeUUIDStringKey])
+            let writeTarget = isDirectory(musicURL) ? musicURL : rootURL
+            let access: DeviceWriteState
+            if values?.volumeIsReadOnly == true {
+                access = .readOnly
+            } else if values?.volumeIsReadOnly == false {
+                access = FileManager.default.isWritableFile(atPath: writeTarget.path) ? .writable : .readOnly
+            } else {
+                access = .unknown
+            }
+            let name = values?.volumeName
                 ?? rootURL.lastPathComponent
-            return IPodDevice(name: name, rootURL: rootURL, musicURL: musicURL)
+            return IPodDevice(name: name, rootURL: rootURL, musicURL: musicURL,
+                              writeState: access, isRockbox: isDirectory(rockbox), volumeIdentifier: values?.volumeUUIDString)
         }
     }
 
@@ -134,6 +154,14 @@ struct IPodImporter: Sendable {
         var copiedDestinations: [URL] = []
 
         for item in files {
+            guard deviceAvailable(device) else {
+                messages.append("设备已断开、已被替换或变为只读，已停止导入。")
+                break
+            }
+            guard let destination = safeDestination(for: item.url, sourceRoot: item.root, device: device) else {
+                messages.append("跳过超出来源或设备目录的文件。")
+                continue
+            }
             let sourceCheck = inspect(item.url)
             if !sourceCheck.playable {
                 skippedUnplayable += 1
@@ -147,9 +175,8 @@ struct IPodImporter: Sendable {
                 missingBitrateFiles.insert(item.url.path)
             }
 
-            let relative = relativePath(of: item.url, from: item.root)
-            let destination = device.musicURL.appendingPathComponent(relative)
             do {
+                guard deviceAvailable(device) else { throw ImportError.deviceUnavailable }
                 try fileManager.createDirectory(
                     at: destination.deletingLastPathComponent(),
                     withIntermediateDirectories: true
@@ -159,12 +186,11 @@ struct IPodImporter: Sendable {
                     if sameSize {
                         alreadyPresent += 1
                     } else {
-                        try fileManager.removeItem(at: destination)
-                        try fileManager.copyItem(at: item.url, to: destination)
-                        imported += 1
+                        messages.append("跳过同名但大小不同的设备文件：\(item.url.lastPathComponent)")
+                        continue
                     }
                 } else {
-                    try fileManager.copyItem(at: item.url, to: destination)
+                    try copyAtomically(item.url, to: destination, device: device)
                     imported += 1
                 }
                 copiedDestinations.append(destination)
@@ -178,20 +204,18 @@ struct IPodImporter: Sendable {
         // beside imported tracks when the download produced one.
         var copiedCoverDirectories = Set<String>()
         for item in files where copiedSourceDirectories.contains(item.url.deletingLastPathComponent().path) {
+            guard deviceAvailable(device) else { break }
             let sourceCover = item.url.deletingLastPathComponent().appendingPathComponent("cover.jpg")
             guard fileManager.fileExists(atPath: sourceCover.path) else { continue }
             guard copiedCoverDirectories.insert(sourceCover.deletingLastPathComponent().path).inserted else { continue }
-            let relativeDirectory = relativePath(of: sourceCover.deletingLastPathComponent(), from: item.root)
-            let destinationCover = device.musicURL
-                .appendingPathComponent(relativeDirectory, isDirectory: true)
-                .appendingPathComponent("cover.jpg")
+            guard let destinationCover = safeDestination(for: sourceCover, sourceRoot: item.root, device: device) else { continue }
             do {
                 try fileManager.createDirectory(
                     at: destinationCover.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
                 if !fileManager.fileExists(atPath: destinationCover.path) {
-                    try fileManager.copyItem(at: sourceCover, to: destinationCover)
+                    try copyAtomically(sourceCover, to: destinationCover, device: device)
                 }
             } catch {
                 messages.append("封面复制失败：\(sourceCover.lastPathComponent)")
@@ -199,6 +223,7 @@ struct IPodImporter: Sendable {
         }
 
         for destination in copiedDestinations {
+            guard deviceAvailable(device) else { break }
             let check = inspect(destination)
             if !check.hasEmbeddedCover { missingDestinationCovers += 1 }
             if check.bitrate == nil { missingBitrateFiles.insert(destination.path) }
@@ -216,8 +241,71 @@ struct IPodImporter: Sendable {
             missingDestinationCovers: missingDestinationCovers,
             missingBitrates: missingBitrateFiles.count,
             sourceFiles: files.count,
+            warningCount: messages.count,
             messages: Array(messages.prefix(20))
         )
+    }
+
+    /// Resolve both sides before writing; a symlink must never escape Music/.
+    func safeDestination(for source: URL, sourceRoot: URL, device: IPodDevice) -> URL? {
+        guard let root = canonicalURL(sourceRoot), let file = canonicalURL(source) else { return nil }
+        guard file.path.hasPrefix(root.path + "/") else { return nil }
+        let relative = relativePath(of: file, from: root)
+        let music = device.musicURL.standardizedFileURL
+        guard let volume = canonicalURL(device.rootURL), let resolvedMusic = canonicalURL(music) else { return nil }
+        guard resolvedMusic.path.hasPrefix(volume.path + "/") else { return nil }
+        guard let destination = canonicalURL(music.appendingPathComponent(relative)) else { return nil }
+        guard destination.path.hasPrefix(resolvedMusic.path + "/") else { return nil }
+        return destination
+    }
+
+    /// Foundation may leave an intermediate symlink unresolved when the final
+    /// file does not exist yet. Resolve every existing prefix before copying.
+    private func canonicalURL(_ url: URL) -> URL? {
+        var remaining = Array(url.pathComponents.dropFirst())
+        var resolved = URL(fileURLWithPath: "/", isDirectory: true)
+        var links = 0
+        while !remaining.isEmpty {
+            let part = remaining.removeFirst()
+            if part == "." { continue }
+            if part == ".." { resolved.deleteLastPathComponent(); continue }
+            resolved.appendPathComponent(part)
+            if let target = try? FileManager.default.destinationOfSymbolicLink(atPath: resolved.path) {
+                links += 1
+                guard links <= 32 else { return nil }
+                let link = URL(fileURLWithPath: target, relativeTo: resolved.deletingLastPathComponent())
+                remaining = Array(link.pathComponents.dropFirst()) + remaining
+                resolved = URL(fileURLWithPath: "/", isDirectory: true)
+            }
+        }
+        // Do not call standardizedFileURL here: on macOS it may rewrite
+        // existing /private/var paths to /var but leave missing tails alone.
+        return resolved
+    }
+
+    private func deviceAvailable(_ device: IPodDevice) -> Bool {
+        guard device.canImport,
+              let values = try? device.rootURL.resourceValues(forKeys: [.isVolumeKey, .volumeIsReadOnlyKey, .volumeUUIDStringKey]),
+              values.isVolume == true, values.volumeIsReadOnly == false,
+              device.volumeIdentifier == nil || values.volumeUUIDString == device.volumeIdentifier else { return false }
+        return FileManager.default.isWritableFile(atPath: device.rootURL.path)
+    }
+
+    private func copyAtomically(_ source: URL, to destination: URL, device: IPodDevice) throws {
+        let staging = destination.deletingLastPathComponent().appendingPathComponent(".musicbridge-\(UUID().uuidString).partial")
+        defer {
+            // Only our own staging file, and only on the same still-mounted device.
+            if deviceAvailable(device) { try? FileManager.default.removeItem(at: staging) }
+        }
+        guard let resolvedSource = canonicalURL(source) else { throw ImportError.deviceUnavailable }
+        try FileManager.default.copyItem(at: resolvedSource, to: staging)
+        guard deviceAvailable(device) else { throw ImportError.deviceUnavailable }
+        try FileManager.default.moveItem(at: staging, to: destination)
+    }
+
+    private enum ImportError: LocalizedError {
+        case deviceUnavailable
+        var errorDescription: String? { "设备已断开或不可写，已停止复制。" }
     }
 
     private func inspect(_ url: URL) -> MediaCheckResult {
@@ -234,9 +322,12 @@ struct IPodImporter: Sendable {
         ]
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 8, execute: timeout)
+            defer { timeout.cancel() }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             guard process.terminationStatus == 0 else {
@@ -274,15 +365,18 @@ struct IPodImporter: Sendable {
             includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
-        return enumerator.compactMap { item -> URL? in
-            guard let url = item as? URL,
+        var files: [URL] = []
+        for case let url as URL in enumerator {
+            if Task.isCancelled { break }
+            guard
                   url.pathExtension.lowercased() != "",
                   audioExtensions.contains(url.pathExtension.lowercased()),
                   (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-                return nil
+                continue
             }
-            return url
+            files.append(url)
         }
+        return files
     }
 
     private func signature(of url: URL) -> FileSignature? {
@@ -293,10 +387,8 @@ struct IPodImporter: Sendable {
     }
 
     private func relativePath(of url: URL, from root: URL) -> String {
-        let prefix = root.standardizedFileURL.path.hasSuffix("/")
-            ? root.standardizedFileURL.path
-            : root.standardizedFileURL.path + "/"
-        var relative = String(url.standardizedFileURL.path.dropFirst(prefix.count))
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        var relative = String(url.path.dropFirst(prefix.count))
         var components = relative.split(separator: "/").map(String.init)
         if components.first == "Apple Music" {
             components.removeFirst()
