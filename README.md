@@ -1,47 +1,79 @@
 # Music Bridge
 
-按用户例图重建的 macOS 应用。SwiftUI 界面，AppKit 窗口，本地 amdl 与 wrapper-lite 下载服务。
+**Keep your playlists on your iPod.**
+
+A native macOS app for playlist downloads and manual music imports to Rockbox iPods. Paste a public NetEase Cloud Music or Apple Music playlist link, use your local download tools, then choose when to copy the music to your device.
+
+English · [简体中文](README.zh-CN.md)
+
+> Source beta. The app interface is currently in Simplified Chinese. Live playlist downloads and imports to a physical iPod have not yet completed end-to-end validation.
+
+![Music Bridge main window with native macOS window controls and no iPod connected](docs/screenshots/music-bridge-main.jpg)
+
+*Captured from the running app on Apple Silicon with macOS 27.2. This is the idle state with no device connected.*
+
+## Features
+
+- **Playlist input:** recognizes public NetEase Cloud Music and Apple Music playlist links. NetEase tracks are matched to the Apple Music China catalog; uncertain matches are skipped.
+- **Local downloads:** calls your separately configured `amdl` and wrapper-lite service, with progress, cancellation and bounded logs.
+- **Lossless quality settings:** choose an ALAC ceiling of 192 kHz or 48 kHz and save cover preferences between launches. Actual quality depends on the available source.
+- **Manual iPod import:** reads mounted device details and enables import only for a writable, supported device. Downloads never trigger an automatic import.
+- **File protection:** checks paths, symbolic links and device identity, uses temporary copy files, and preserves existing files when their sizes differ. Same-path files with matching sizes are skipped.
+- **Native desktop interface:** SwiftUI and AppKit, macOS window controls, translucent surfaces, pointer lighting and subtle card movement. Respects Reduce Motion, Reduce Transparency and Increase Contrast.
+
+### Pointer interaction
+
+![Sampled app captures showing the light spot at different pointer positions within the source card](docs/screenshots/pointer-hover.gif)
+
+*Four actual app captures, shown as a slowed sequence of hover states. This is not a real-time frame-rate recording. The full window screenshot above shows the window controls; this close-up focuses on the source card.*
+
+## Build and run
+
+You need macOS and Swift 6 or later with the macOS SDK. The package declares macOS 14 as its minimum; building and launching have been verified on Apple Silicon with macOS 27.2. Older supported systems have not been tested.
+
+From the repository root:
 
 ```sh
 bash script/build_and_run.sh --verify
 ```
 
-构建产物：`dist/MusicBridgeApp.app`。打开即读取实际挂载设备，没有演示模式。名称、挂载点和可写状态取自系统；未连接、只读或权限不明时不能导入。下载与导入分开执行，点击“开始导入”才扫描并复制文件。
+The script creates and opens `dist/MusicBridgeApp.app`. Building the interface does not require a download service. The app is not Developer ID signed or notarized, and this repository does not provide an installer.
 
-展开“下载设置”可选择“高解析度无损 · ALAC（最高 192 kHz）”或“无损 · ALAC（最高 48 kHz）”，默认最高无损，选择会保留到下次启动。下载器实际接收对应的 `--alac-max` 参数。该值是质量上限，实际采样率与位深由曲目提供的音源决定。
+## Configure downloads
 
-界面使用 macOS 系统半透明材质，板块随鼠标产生小幅浮动、倾斜和柔光。编辑输入框时对应卡片会回到平面；失焦时复位。按钮、进度、数值、连接状态及折叠区域有统一过渡，并响应系统的“减少动态效果”“减少透明度”和“增强对比度”。
+Install and configure the external [amdl downloader](https://github.com/zhaarey/apple-music-downloader) and [wrapper-lite service](https://github.com/WorldObservationLog/wrapper/tree/lite) using their upstream instructions. The app expects these paths relative to the project root:
 
-窗口左上角保留 macOS 原生关闭、最小化和缩放／全屏按钮。光斑使用当前窗口内的鼠标事件，并按每个板块的实际范围换算坐标。
+| Path | Purpose |
+| --- | --- |
+| `amdl` | Downloader executable |
+| `config.yaml` | Your downloader configuration |
+| `work/wrapper-lite-macos/start-local.sh` | Local wrapper launcher |
+| `work/wrapper-lite-macos/` | Wrapper and QEMU runtime files |
 
-## 项目文件与本地运行依赖
+The local wrapper endpoint is `http://127.0.0.1:12340`. A valid login, a ready service and an accessible playlist are required. Audio inspection also requires `ffprobe` (available with FFmpeg).
 
-源码、图标、检查程序和构建脚本集中在同一项目根目录：`MacApp/`、`script/`。应用从 `dist/MusicBridgeApp.app` 的位置解析项目根目录，移动项目后应重新运行构建脚本。
+Keep the app in `dist/` relative to the project root so it can find these dependencies. Rebuild after moving the project. Authentication disks, personal configuration, downloaded music, logs and build artifacts are excluded from version control.
 
-以下内容仅保留在本地，不上传 GitHub：
+## Import to an iPod
 
-- `amdl`、`config.yaml`：独立下载器及个人运行配置。
-- `work/wrapper-lite-macos/`：wrapper、QEMU 和包含登录态的虚拟机磁盘。
-- `dist/`、`.build/`、下载音乐、日志及备份文件。
+1. Connect a mounted, writable Rockbox iPod.
+2. Download music using your configured local tools.
+3. Select **开始导入** (Start import) to scan the download folders and copy files into the device's `Music/` directory.
 
-从 GitHub 克隆后可以直接构建界面；完整下载功能还需自行配置上述外部依赖，并安装可用的 `ffprobe`。不要将认证磁盘或个人配置加入版本管理。
+The app cannot import while the device is disconnected, read-only or has an unknown write state. It does not overwrite existing files whose sizes differ. Matching file sizes are a skip rule, not a content-identity check. A successful `ffprobe` inspection is not a guarantee of playback on every Rockbox device.
 
-`work/wrapper-lite-macos/qemu/data.img` 是从 Muse 备份复制的 67108864 字节运行磁盘。Muse 中的备份未修改。磁盘、运行配置和下载数据均已排除在 Git 之外。文件恢复不代表 Apple 登录态已经通过在线验证。
-
-## 定向检查
+## Checks and current limits
 
 ```sh
 bash script/check.sh
 ```
 
-检查公开歌单来源、伪造域名拒绝、任务取消、设备状态与导入门禁、音质和封面设置保存、实际下载参数、动效输入边界与减少动态效果分支、配置保留、导入路径和符号链接边界、旧服务检查回调，以及进程末尾无换行输出。进程回归使用临时脚本和注入的就绪响应，不访问 Apple 登录态，也不下载音乐。采用独立 Swift 检查程序，当前机器的 Command Line Tools 缺少 XCTest，无法运行标准 `swift test`。
+The standalone Swift checks cover link validation, cancellation, download arguments, quality and cover preferences, import guards, path and symbolic-link containment, stale callbacks, process output and bounded pointer input. They use temporary files and injected service responses; they do not sign in, download music or write to a physical device.
 
-本轮检查修复了主线程目录扫描、取消后更新旧结果、旧进程输出串入新任务、末行输出遗漏、封面设置未保存、导入路径越界、断连/卷标识检查、拷贝中间文件和导入期间窗口关闭等问题。目录扫描在后台执行；复制使用同目录临时文件后移入目标；已有文件不覆盖。ffprobe 的错误输出不再使用未排空的管道，检查进程有超时终止。
+The full download and physical-device import workflows still need end-to-end validation. External services may change, and source availability and catalog matching vary by region and release.
 
-## 使用边界
+## Privacy and license
 
-- 实际下载要求本地服务就绪、Apple 登录仍有效、公开歌单可访问；尚未用真实歌单验证完整下载。
-- iPod 未连接时实际模式显示“等待连接”，导入按钮不可用。
-- 同名同大小的设备文件跳过；同名但大小不同的文件保留，不覆盖。
-- 导入的音频检查依赖本机 ffprobe；没有 ffprobe 时不能验证可播放性。
-- 原图是视觉验收依据。构建成功和窗口启动不等于“100% 还原”通过。
+NetEase playlist links are sent to the third-party GoMusic service. Apple Music matching accesses Apple's public website and catalog endpoints. Login credentials and subscription access are managed through your external tools.
+
+Only process music you have permission to access. Source is licensed under [MIT](LICENSE). Dependency, asset and trademark information is listed in [Third-party notices](THIRD_PARTY_NOTICES.md).

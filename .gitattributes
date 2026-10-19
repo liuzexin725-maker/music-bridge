@@ -1,5 +1,7 @@
 * text=auto eol=lf
 *.png binary
+*.jpg binary
+*.gif binary
 *.icns binary
 *.mp4 binary
 *.m4s binary
