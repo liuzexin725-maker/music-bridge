@@ -7,21 +7,31 @@ import Foundation
 /// is the success signal. Keeping that check here prevents the UI from
 /// starting amdl and then presenting a misleading download failure.
 final class DownloaderRunner: NSObject {
+    typealias StatusProbe = (URL, @escaping (Result<Void, Error>) -> Void) -> Void
     var onOutput: ((String) -> Void)?
     var onStarted: (() -> Void)?
     var onFinished: ((Int32) -> Void)?
 
     private var process: Process?
     private var wrapperProcess: Process?
+    private var generation = UUID()
     private let ioQueue = DispatchQueue(label: "cn.unmeta.musicbridge.downloader-io")
+    private let statusProbe: StatusProbe?
+
+    init(statusProbe: StatusProbe? = nil) {
+        self.statusProbe = statusProbe
+        super.init()
+    }
 
     func start(binaryPath: String,
                workingDirectory: String,
                urls: [String],
                wrapperLauncherPath: String?,
                wrapperURL: URL,
+               quality: AudioQuality,
                completion: @escaping (Result<Void, Error>) -> Void) {
         stopDownloader()
+        generation = UUID()
 
         let binaryURL = URL(fileURLWithPath: binaryPath)
         let directoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
@@ -40,6 +50,7 @@ final class DownloaderRunner: NSObject {
                                   directoryURL: directoryURL,
                                   urls: urls,
                                   wrapperURL: wrapperURL,
+                                  quality: quality,
                                   completion: completion)
         }
 
@@ -55,6 +66,7 @@ final class DownloaderRunner: NSObject {
                                   directoryURL: URL,
                                   urls: [String],
                                   wrapperURL: URL,
+                                  quality: AudioQuality,
                                   completion: @escaping (Result<Void, Error>) -> Void) {
         let process = Process()
         process.executableURL = binaryURL
@@ -65,7 +77,7 @@ final class DownloaderRunner: NSObject {
         // current binary already returns a non-zero exit status on failure;
         // older builds accepted --exit-on-error, but current amdl rejects it
         // before it can inspect the playlist URL.
-        process.arguments = ["--lite-server", wrapperURL.absoluteString, "--json"] + urls
+        process.arguments = Self.arguments(urls: urls, wrapperURL: wrapperURL, quality: quality)
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -87,11 +99,18 @@ final class DownloaderRunner: NSObject {
         do {
             try process.run()
             self.process = process
-            DispatchQueue.main.async { [weak self] in self?.onStarted?() }
+            DispatchQueue.main.async { [weak self] in
+                guard self?.process === process else { return }
+                self?.onStarted?()
+            }
             complete(completion, with: .success(()))
         } catch {
             complete(completion, with: .failure(RunnerError.launchFailed(error.localizedDescription)))
         }
+    }
+
+    static func arguments(urls: [String], wrapperURL: URL, quality: AudioQuality) -> [String] {
+        ["--lite-server", wrapperURL.absoluteString, "--alac-max", String(quality.maximumSampleRate), "--json"] + urls
     }
 
     private func waitForWrapper(orStartAt launcherPath: String?,
@@ -158,6 +177,7 @@ final class DownloaderRunner: NSObject {
                                        attempts: Int,
                                        then action: @escaping () -> Void,
                                        failure: @escaping (Error) -> Void) {
+        let session = generation
         checkWrapper(wrapperURL: wrapperURL) { [weak self] result in
             guard let self else { return }
             switch result {
@@ -172,6 +192,7 @@ final class DownloaderRunner: NSObject {
                     return
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    guard self.generation == session else { return }
                     self.waitUntilWrapperReady(wrapperURL: wrapperURL,
                                                attempts: attempts - 1,
                                                then: action,
@@ -183,47 +204,51 @@ final class DownloaderRunner: NSObject {
 
     private func checkWrapper(wrapperURL: URL,
                               completion: @escaping (Result<Void, Error>) -> Void) {
+        let session = generation
+        if let statusProbe {
+            statusProbe(wrapperURL) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard self?.generation == session else { return }
+                    completion(result)
+                }
+            }
+            return
+        }
         var request = URLRequest(url: wrapperURL.appendingPathComponent("status"))
         request.timeoutInterval = 1.5
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error {
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let deliver: (Result<Void, Error>) -> Void = { result in
                 DispatchQueue.main.async {
-                    completion(.failure(RunnerError.wrapperUnavailable(error.localizedDescription)))
+                    guard self?.generation == session else { return }
+                    completion(result)
                 }
+            }
+            if let error {
+                deliver(.failure(RunnerError.wrapperUnavailable(error.localizedDescription)))
                 return
             }
             guard let http = response as? HTTPURLResponse else {
-                DispatchQueue.main.async {
-                    completion(.failure(RunnerError.wrapperUnavailable("没有收到有效响应")))
-                }
+                deliver(.failure(RunnerError.wrapperUnavailable("没有收到有效响应")))
                 return
             }
             guard http.statusCode == 200 else {
-                DispatchQueue.main.async {
-                    completion(.failure(RunnerError.wrapperUnavailable("HTTP \(http.statusCode)")))
-                }
+                deliver(.failure(RunnerError.wrapperUnavailable("HTTP \(http.statusCode)")))
                 return
             }
             guard let data, !data.isEmpty else {
-                DispatchQueue.main.async {
-                    completion(.failure(RunnerError.wrapperUnavailable("响应为空")))
-                }
+                deliver(.failure(RunnerError.wrapperUnavailable("响应为空")))
                 return
             }
             do {
                 let envelope = try JSONDecoder().decode(WrapperStatusEnvelope.self, from: data)
                 guard envelope.code == 0 else {
                     let message = envelope.msg?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "服务返回错误"
-                    DispatchQueue.main.async {
-                        completion(.failure(RunnerError.wrapperUnavailable("code=\(envelope.code) \(message)")))
-                    }
+                    deliver(.failure(RunnerError.wrapperUnavailable("code=\(envelope.code) \(message)")))
                     return
                 }
-                DispatchQueue.main.async { completion(.success(())) }
+                deliver(.success(()))
             } catch {
-                DispatchQueue.main.async {
-                    completion(.failure(RunnerError.wrapperUnavailable("响应不是有效的 JSON：\(error.localizedDescription)")))
-                }
+                deliver(.failure(RunnerError.wrapperUnavailable("响应不是有效的 JSON：\(error.localizedDescription)")))
             }
         }.resume()
     }
@@ -231,34 +256,24 @@ final class DownloaderRunner: NSObject {
     /// Read every chunk from a child process and forward complete lines to the
     /// main queue. This is intentionally shared by amdl and wrapper-lite.
     private func attachOutput(_ pipe: Pipe, prefix: String?) {
-        var pending = Data()
+        let session = generation
+        var buffer = OutputLineBuffer()
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
-            }
+            if data.isEmpty { handle.readabilityHandler = nil }
             self?.ioQueue.async {
-                pending.append(data)
-                while let separator = pending.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
-                    let lineData = pending[..<separator]
-                    pending.removeSubrange(...separator)
-                    // Progress bars commonly use CR in place of LF. Treat a
-                    // CRLF pair as one separator so the UI receives clean
-                    // progress updates without duplicate empty lines.
-                    while let next = pending.first, next == 0x0A || next == 0x0D {
-                        pending.removeFirst()
-                    }
-                    guard var line = String(data: lineData, encoding: .utf8), !line.isEmpty else { continue }
-                    if let prefix { line = "[\(prefix)] \(line)" }
-                    self?.emit(line)
+                for line in buffer.append(data, endOfFile: data.isEmpty) {
+                    self?.emit(prefix.map { "[\($0)] \(line)" } ?? line, session: session)
                 }
             }
         }
     }
 
-    private func emit(_ line: String) {
-        DispatchQueue.main.async { [weak self] in self?.onOutput?(line) }
+    private func emit(_ line: String, session: UUID? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, session == nil || session == self.generation else { return }
+            self.onOutput?(line)
+        }
     }
 
     private func complete(_ completion: @escaping (Result<Void, Error>) -> Void,
@@ -275,6 +290,7 @@ final class DownloaderRunner: NSObject {
 
     /// Stop both children, used when the user explicitly presses Stop.
     func stop() {
+        generation = UUID()
         stopDownloader()
         wrapperProcess?.terminate()
         wrapperProcess = nil
